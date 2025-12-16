@@ -150,7 +150,7 @@ fn config_key_to_action(key: &String) -> Action {
 }
 
 fn read_config() -> HashMap<Shortcut, Action> {
-    let config = ini!(&(get_dll_path() + "\\sorceries_incantations_keybinds.ini"));
+    let config = ini!(&(get_dll_path() + "\\spell_keybinds.ini"));
 
     let config: HashMap<Shortcut, Action> = config["keybinds"].iter()
         .map(|(k, v)| { (k, parse_input(&v.clone().unwrap_or(String::new()))) })

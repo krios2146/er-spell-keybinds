@@ -1,5 +1,5 @@
 [package]
-name = "sorceries-incantations-keybinds"
+name = "spell-keybinds"
 version = "0.1.0"
 edition = "2024"
 
