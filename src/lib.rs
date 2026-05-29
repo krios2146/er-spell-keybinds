@@ -4,15 +4,9 @@ use crate::mapper::{map_key, map_modifier};
 
 use ini::ini;
 
-use pelite::{
-    pattern,
-    pe32::headers::SectionHeader,
-    pe64::{Pe, PeObject, PeView},
-};
 use std::{
     collections::{HashMap, HashSet},
     path::Path,
-    ptr::read_unaligned,
     time::{Duration, Instant},
 };
 use windows::{
@@ -20,9 +14,7 @@ use windows::{
     Win32::{
         Foundation::{HMODULE, MAX_PATH},
         System::LibraryLoader::{
-            GetModuleFileNameW,
-            GetModuleHandleExW,
-            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+            GetModuleFileNameW, GetModuleHandleExW, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
             GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
         },
     },
@@ -39,74 +31,14 @@ use fromsoftware_shared::{program::Program, task::*, FromStatic};
 use device_query::{DeviceQuery, DeviceState, Keycode};
 use keyboard_codes::{parse_input, Modifier, Shortcut};
 
-const GAME_DATA_MAN_PATTERN_STR: &str = "48 8B 05 ? ? ? ? 48 85 C0 74 05 48 8B 40 58 C3 C3";
-
-const OFFSET: usize = 3;
-const ADDITIONAL: usize = 7;
-
 enum Action {
     SetMemorySlot(u8),
     CycleBack,
     NoOp,
 }
 
-fn get_pe_view() -> PeView<'static> {
-    let pe_view = match Program::current() {
-        Program::Mapping(mapping) => mapping,
-        Program::File(file) => PeView::from_bytes(file.image()).unwrap()
-    };
-
-    pe_view
-}
-
-fn get_text_header(pe: PeView<'_>) -> &SectionHeader {
-    let text_header = match pe
-        .section_headers()
-        .iter()
-        .find(|h| h.name() == Ok(".text"))
-    {
-        Some(h) => { h }
-        None => { panic!() }
-    };
-    text_header
-}
-
-fn get_game_data_man() -> &'static mut GameDataMan {
-    let pattern = match pattern::parse(GAME_DATA_MAN_PATTERN_STR) {
-        Ok(p) => p,
-        Err(_) => { panic!() }
-    };
-
-    let pe = get_pe_view();
-    let text_header = get_text_header(pe);
-
-    let scanner = pe.scanner();
-
-    let mut rva = [0; 8];
-    let mut matches = scanner.matches(&*pattern, text_header.file_range());
-
-    let game_data_man = loop {
-        if !matches.next(&mut rva) {
-            panic!()
-        }
-
-        let rva = rva[0] as usize;
-
-        let resolved_va = unsafe {
-            let aob_va = pe.image().as_ptr().add(rva);
-
-            let offset_value = read_unaligned(aob_va.add(OFFSET) as *const i32);
-
-            let resolved_va = aob_va.add(ADDITIONAL).offset(offset_value as isize);
-
-            resolved_va
-        };
-
-        let pointer: *const *mut GameDataMan = resolved_va as *const *mut GameDataMan;
-        let game_data_man_ptr: *mut GameDataMan = unsafe { *pointer };
-        break unsafe { &mut *game_data_man_ptr };
-    };
-    game_data_man
+fn get_game_data_man() -> Option<&'static mut GameDataMan> {
+    unsafe { GameDataMan::instance_mut().ok() }
 }
 
 fn get_dll_path() -> String {
@@ -119,7 +51,8 @@ fn get_dll_path() -> String {
             GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
             PCWSTR(addr),
             &mut module,
-        ).expect("GetModuleHandleExW failed");
+        )
+        .expect("GetModuleHandleExW failed");
 
         let mut buf = [0u16; MAX_PATH as usize];
         let len = GetModuleFileNameW(Some(module), &mut buf);
@@ -151,11 +84,12 @@ fn config_key_to_action(key: &String) -> Action {
 fn read_config() -> HashMap<Shortcut, Action> {
     let config = ini!(&(get_dll_path() + "\\spell_keybinds.ini"));
 
-    let config: HashMap<Shortcut, Action> = config["keybinds"].iter()
-        .map(|(k, v)| { (k, parse_input(&v.clone().unwrap_or(String::new()))) })
+    let config: HashMap<Shortcut, Action> = config["keybinds"]
+        .iter()
+        .map(|(k, v)| (k, parse_input(&v.clone().unwrap_or(String::new()))))
         .filter(|kv| kv.1.is_ok())
         .map(|(k, v)| (k, v.unwrap()))
-        .map(|(k, v)| { (config_key_to_action(k), v) })
+        .map(|(k, v)| (config_key_to_action(k), v))
         .filter(|(action, _)| !matches!(action, Action::NoOp))
         .map(|(k, v)| (v, k))
         .collect();
@@ -163,13 +97,34 @@ fn read_config() -> HashMap<Shortcut, Action> {
     config
 }
 
-fn set_memory_slot(game_data_man: &mut GameDataMan, slot_index: u8) {
-    let equipped_magic_ptr = game_data_man.main_player_game_data.equipment.equip_magic_data.as_ptr();
+fn equipped_magic_slot_count(game_data_man: &mut GameDataMan) -> usize {
+    let equipped_magic_ptr = game_data_man
+        .main_player_game_data
+        .equipment
+        .equip_magic_data
+        .as_ptr();
     let equipped_magic = unsafe { &mut *equipped_magic_ptr };
 
-    let last_slot = equipped_magic.entries.iter()
+    equipped_magic
+        .entries
+        .iter()
         .filter(|e| e.param_id > 1)
-        .count() - 1;
+        .count()
+}
+
+fn set_memory_slot(game_data_man: &mut GameDataMan, slot_index: u8) {
+    let slot_count = equipped_magic_slot_count(game_data_man);
+    if slot_count == 0 {
+        return;
+    }
+
+    let equipped_magic_ptr = game_data_man
+        .main_player_game_data
+        .equipment
+        .equip_magic_data
+        .as_ptr();
+    let equipped_magic = unsafe { &mut *equipped_magic_ptr };
+    let last_slot = slot_count - 1;
 
     if slot_index > last_slot as u8 {
         equipped_magic.selected_slot = last_slot as i32;
@@ -180,13 +135,20 @@ fn set_memory_slot(game_data_man: &mut GameDataMan, slot_index: u8) {
 }
 
 fn back_cycle_memory_slot(game_data_man: &mut GameDataMan) {
-    let equipped_magic_ptr = game_data_man.main_player_game_data.equipment.equip_magic_data.as_ptr();
+    let slot_count = equipped_magic_slot_count(game_data_man);
+    if slot_count == 0 {
+        return;
+    }
+
+    let equipped_magic_ptr = game_data_man
+        .main_player_game_data
+        .equipment
+        .equip_magic_data
+        .as_ptr();
     let equipped_magic = unsafe { &mut *equipped_magic_ptr };
 
     let previous_slot = equipped_magic.selected_slot - 1;
-    let last_slot = equipped_magic.entries.iter()
-        .filter(|e| e.param_id > 1)
-        .count() - 1;
+    let last_slot = slot_count - 1;
 
     if previous_slot < 0 {
         equipped_magic.selected_slot = last_slot as i32;
@@ -216,13 +178,18 @@ fn cartesian_product(keycodes: Vec<HashSet<Keycode>>) -> Vec<HashSet<Keycode>> {
     product
 }
 
-fn expand_combinations(key: Keycode, modifiers: Vec<Modifier>, action: &Action) -> Vec<(HashSet<Keycode>, &Action)> {
+fn expand_combinations(
+    key: Keycode,
+    modifiers: Vec<Modifier>,
+    action: &Action,
+) -> Vec<(HashSet<Keycode>, &Action)> {
     if modifiers.is_empty() {
         let mut set = HashSet::new();
         set.insert(key);
         return vec![(set, action)];
     }
-    let mod_keycodes = modifiers.iter()
+    let mod_keycodes = modifiers
+        .iter()
         .map(|m| {
             let mut set = HashSet::new();
 
@@ -251,7 +218,10 @@ fn expand_combinations(key: Keycode, modifiers: Vec<Modifier>, action: &Action) 
         .collect()
 }
 
-fn is_all_keybinding_keys_pressed(keybindings: &HashSet<Keycode>, pressed_keys: &Vec<Keycode>) -> bool {
+fn is_all_keybinding_keys_pressed(
+    keybindings: &HashSet<Keycode>,
+    pressed_keys: &Vec<Keycode>,
+) -> bool {
     for key in keybindings {
         if !pressed_keys.contains(key) {
             return false;
@@ -285,30 +255,35 @@ pub unsafe extern "C" fn DllMain(_hmodule: u64, reason: u32) -> bool {
 
         cs_task.run_recurring(
             move |_: &FD4TaskData| {
-                let Some(main_player) = unsafe { WorldChrMan::instance() }
+                let Some(main_player) = unsafe { WorldChrMan::instance_mut() }
                     .ok()
                     .and_then(|wcm| wcm.main_player.as_mut())
                 else {
-                    return
+                    return;
                 };
-                if main_player.chr_ins.module_container.data.hp <= 0 {
+                if main_player.chr_ins.modules.data.hp <= 0 {
                     return;
                 }
 
+                let Some(game_data_man) = get_game_data_man() else {
+                    return;
+                };
+
                 if player_hud_type.is_none() {
-                    player_hud_type = Some(get_game_data_man().game_settings.hud_type);
+                    player_hud_type = Some(game_data_man.game_settings.hud_type);
                 }
 
-                let is_need_to_restore_hud = !is_hud_restored &&
-                    last_hud_update_run.elapsed() > hud_update_rebound &&
-                    get_game_data_man().game_settings.hud_type != player_hud_type.unwrap();
+                let is_need_to_restore_hud = !is_hud_restored
+                    && last_hud_update_run.elapsed() > hud_update_rebound
+                    && game_data_man.game_settings.hud_type != player_hud_type.unwrap();
 
                 if is_need_to_restore_hud {
-                    get_game_data_man().game_settings.hud_type = player_hud_type.unwrap();
+                    game_data_man.game_settings.hud_type = player_hud_type.unwrap();
                     is_hud_restored = true;
                 }
 
-                let mut keybindings = config.iter()
+                let mut keybindings = config
+                    .iter()
                     .map(|(s, a)| (s.key, s.modifiers.clone(), a))
                     .map(|(k, m, a)| (map_key(&k), m, a))
                     .filter(|kma| kma.0.is_some())
@@ -326,21 +301,21 @@ pub unsafe extern "C" fn DllMain(_hmodule: u64, reason: u32) -> bool {
                     }
                     match action {
                         Action::SetMemorySlot(slot) => {
-                            get_game_data_man().game_settings.hud_type = HudType::On;
+                            game_data_man.game_settings.hud_type = HudType::On;
                             last_hud_update_run = Instant::now();
                             is_hud_restored = false;
 
-                            set_memory_slot(get_game_data_man(), slot - 1);
+                            set_memory_slot(game_data_man, slot - 1);
                         }
                         Action::CycleBack => {
                             if last_cycle_back_run.elapsed() < cycle_back_rebound {
                                 return;
                             }
-                            get_game_data_man().game_settings.hud_type = HudType::On;
+                            game_data_man.game_settings.hud_type = HudType::On;
                             last_hud_update_run = Instant::now();
                             is_hud_restored = false;
 
-                            back_cycle_memory_slot(get_game_data_man());
+                            back_cycle_memory_slot(game_data_man);
                             last_cycle_back_run = Instant::now();
                         }
                         Action::NoOp => {}
