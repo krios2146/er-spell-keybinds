@@ -25,6 +25,11 @@ use windows::{
             GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
             GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
         },
+        UI::Input::KeyboardAndMouse::{
+            SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_KEYUP,
+            MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
+            MOUSEINPUT, VIRTUAL_KEY,
+        },
     },
 };
 
@@ -46,6 +51,7 @@ const ADDITIONAL: usize = 7;
 
 enum Action {
     SetMemorySlot(u8),
+    SetQuickSlot(u8),
     CycleBack,
     NoOp,
 }
@@ -134,18 +140,16 @@ fn get_dll_path() -> String {
 }
 
 fn config_key_to_action(key: &String) -> Action {
-    match key.strip_prefix("memory_slot_") {
-        Some(s) => {
-            let slot: u8 = s.parse().unwrap();
-            Action::SetMemorySlot(slot)
-        }
-        None => {
-            if key.contains("cycle") {
-                return Action::CycleBack;
-            };
-            Action::NoOp
-        }
+    if let Some(s) = key.strip_prefix("memory_slot_") {
+        return Action::SetMemorySlot(s.parse().unwrap());
     }
+    if let Some(s) = key.strip_prefix("quick_slot_") {
+        return Action::SetQuickSlot(s.parse().unwrap());
+    }
+    if key.contains("cycle") {
+        return Action::CycleBack;
+    }
+    Action::NoOp
 }
 
 fn read_config() -> HashMap<Shortcut, Action> {
@@ -163,37 +167,241 @@ fn read_config() -> HashMap<Shortcut, Action> {
     config
 }
 
-fn set_memory_slot(game_data_man: &mut GameDataMan, slot_index: u8) {
-    let equipped_magic_ptr = game_data_man.main_player_game_data.equipment.equip_magic_data.as_ptr();
-    let equipped_magic = unsafe { &mut *equipped_magic_ptr };
 
-    let last_slot = equipped_magic.entries.iter()
-        .filter(|e| e.param_id > 1)
-        .count() - 1;
+fn ini_value(
+    config: &HashMap<String, HashMap<String, Option<String>>>,
+    section: &str,
+    key: &str,
+) -> Option<String> {
+    config.get(section)?.get(key)?.clone()
+}
 
-    if slot_index > last_slot as u8 {
-        equipped_magic.selected_slot = last_slot as i32;
-        return;
+#[derive(Clone, Copy)]
+enum CastInput {
+    MouseLeft,
+    MouseRight,
+    Key(u16),
+}
+
+fn parse_cast_input(value: &str) -> Option<CastInput> {
+    if value.eq_ignore_ascii_case("off") {
+        return None;
     }
+    if value.eq_ignore_ascii_case("MouseLeft") {
+        return Some(CastInput::MouseLeft);
+    }
+    if value.eq_ignore_ascii_case("MouseRight") {
+        return Some(CastInput::MouseRight);
+    }
+    let upper = value.trim().to_ascii_uppercase();
+    let vk = match upper.as_str() {
+        "CTRL" | "CONTROL" | "LEFTCTRL" | "LEFTCONTROL" => 0xA2,
+        "RIGHTCTRL" | "RIGHTCONTROL" => 0xA3,
+        "SHIFT" | "LEFTSHIFT" => 0xA0,
+        "RIGHTSHIFT" => 0xA1,
+        "ALT" | "LEFTALT" => 0xA4,
+        "RIGHTALT" => 0xA5,
+        "TAB" => 0x09,
+        _ => use_key_vk(&value),
+    };
+    Some(CastInput::Key(vk))
+}
 
-    equipped_magic.selected_slot = slot_index as i32;
+fn read_autocast() -> Option<CastInput> {
+    let config = ini!(&(get_dll_path() + "\\spell_keybinds.ini"));
+    let value = ini_value(&config, "keybinds", "auto_cast")?;
+    parse_cast_input(&value)
+}
+
+fn read_second_catalyst() -> Option<CastInput> {
+    let config = ini!(&(get_dll_path() + "\\spell_keybinds.ini"));
+    let value = ini_value(&config, "keybinds", "2nd_catalyst")?;
+    parse_cast_input(&value)
+}
+
+fn read_second_catalyst_slots() -> HashSet<u8> {
+    let config = ini!(&(get_dll_path() + "\\spell_keybinds.ini"));
+    ini_value(&config, "keybinds", "2nd_catalyst_slots")
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|part| part.trim().parse::<u8>().ok())
+        .collect()
+}
+
+fn hold_cast(input: CastInput, down: bool) {
+    match input {
+        CastInput::MouseLeft => mouse_button(true, down),
+        CastInput::MouseRight => mouse_button(false, down),
+        CastInput::Key(vk) => key_button(vk, down),
+    }
+}
+
+fn key_button(vk: u16, down: bool) {
+    let scan = unsafe {
+        windows::Win32::UI::Input::KeyboardAndMouse::MapVirtualKeyW(
+            vk as u32,
+            windows::Win32::UI::Input::KeyboardAndMouse::MAPVK_VK_TO_VSC,
+        ) as u16
+    };
+    let flags = if down {
+        windows::Win32::UI::Input::KeyboardAndMouse::KEYEVENTF_SCANCODE
+    } else {
+        windows::Win32::UI::Input::KeyboardAndMouse::KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP
+    };
+    let mut input = INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: VIRTUAL_KEY(0),
+                wScan: scan,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    };
+    unsafe {
+        SendInput(std::slice::from_mut(&mut input), std::mem::size_of::<INPUT>() as i32);
+    }
+}
+
+fn mouse_button(left_button: bool, down: bool) {
+    let flags = match (left_button, down) {
+        (true, true) => MOUSEEVENTF_LEFTDOWN,
+        (true, false) => MOUSEEVENTF_LEFTUP,
+        (false, true) => MOUSEEVENTF_RIGHTDOWN,
+        (false, false) => MOUSEEVENTF_RIGHTUP,
+    };
+    let mut input = INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 {
+            mi: MOUSEINPUT {
+                dx: 0,
+                dy: 0,
+                mouseData: 0,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    };
+    unsafe {
+        SendInput(std::slice::from_mut(&mut input), std::mem::size_of::<INPUT>() as i32);
+    }
+}
+
+fn use_key_vk(name: &str) -> u16 {
+    let upper = name.trim().to_ascii_uppercase();
+    match upper.as_str() {
+        "CTRL" | "CONTROL" | "LEFTCTRL" | "LEFTCONTROL" => return 0xA2,
+        "RIGHTCTRL" | "RIGHTCONTROL" => return 0xA3,
+        "SHIFT" | "LEFTSHIFT" => return 0xA0,
+        "RIGHTSHIFT" => return 0xA1,
+        "ALT" | "LEFTALT" => return 0xA4,
+        "RIGHTALT" => return 0xA5,
+        "TAB" => return 0x09,
+        _ => {}
+    }
+    if upper.len() == 1 {
+        let ch = upper.as_bytes()[0];
+        if ch.is_ascii_alphanumeric() {
+            return ch as u16;
+        }
+    }
+    if let Some(rest) = upper.strip_prefix('F') {
+        if let Ok(n) = rest.parse::<u16>() {
+            if (1..=24).contains(&n) {
+                return 0x6F + n;
+            }
+        }
+    }
+    0x52
+}
+
+fn read_autouse() -> Option<u16> {
+    let config = ini!(&(get_dll_path() + "\\spell_keybinds.ini"));
+    let Some(value) = ini_value(&config, "keybinds", "auto_use") else {
+        return None;
+    };
+    if value.eq_ignore_ascii_case("off") {
+        return None;
+    }
+    Some(use_key_vk(&value))
+}
+
+fn press_use_item(vk: u16) {
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(80));
+        let scan = unsafe {
+            windows::Win32::UI::Input::KeyboardAndMouse::MapVirtualKeyW(
+                vk as u32,
+                windows::Win32::UI::Input::KeyboardAndMouse::MAPVK_VK_TO_VSC,
+            ) as u16
+        };
+        let mut input = INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: VIRTUAL_KEY(0),
+                    wScan: scan,
+                    dwFlags: windows::Win32::UI::Input::KeyboardAndMouse::KEYEVENTF_SCANCODE,
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        };
+        unsafe {
+            SendInput(std::slice::from_mut(&mut input), std::mem::size_of::<INPUT>() as i32);
+            std::thread::sleep(Duration::from_millis(40));
+            input.Anonymous.ki.dwFlags = windows::Win32::UI::Input::KeyboardAndMouse::KEYEVENTF_SCANCODE
+                | KEYEVENTF_KEYUP;
+            SendInput(std::slice::from_mut(&mut input), std::mem::size_of::<INPUT>() as i32);
+        }
+    });
+}
+
+fn set_memory_slot(game_data_man: &mut GameDataMan, slot_index: u8) {
+    unsafe {
+        let gdm = game_data_man as *mut GameDataMan as *const u8;
+
+        // Correct chain from TGA table: +0x08 → +0x530 → +0x80
+        let p1 = *(gdm.add(0x08) as *const *mut u8);
+        if p1.is_null() || (p1 as usize) < 0x10000 { return; }
+
+        let equip_magic_data = *(p1.add(0x530) as *const *mut u8);
+        if equip_magic_data.is_null() || (equip_magic_data as usize) < 0x10000 { return; }
+
+        // selected_slot is at +0x80
+        let target = slot_index.min(13);
+        *(equip_magic_data.add(0x80) as *mut i32) = target as i32;
+    }
+}
+
+fn set_quick_slot(game_data_man: &mut GameDataMan, slot_index: u8) {
+    unsafe {
+        let gdm = game_data_man as *mut GameDataMan as *const u8;
+
+        // Chain from pointer scan: +0x8 → +0x5D8
+        let p1 = *(gdm.add(0x8) as *const *mut u8);
+        if p1.is_null() || (p1 as usize) < 0x10000 { return; }
+
+        let target = slot_index.min(9);
+        *(p1.add(0x5D8) as *mut i32) = target as i32;
+    }
 }
 
 fn back_cycle_memory_slot(game_data_man: &mut GameDataMan) {
-    let equipped_magic_ptr = game_data_man.main_player_game_data.equipment.equip_magic_data.as_ptr();
-    let equipped_magic = unsafe { &mut *equipped_magic_ptr };
+    unsafe {
+        let gdm = game_data_man as *mut GameDataMan as *const u8;
+        let p1 = *(gdm.add(0x08) as *const *mut u8);
+        if p1.is_null() || (p1 as usize) < 0x10000 { return; }
+        let equip_magic_data = *(p1.add(0x530) as *const *mut u8);
+        if equip_magic_data.is_null() || (equip_magic_data as usize) < 0x10000 { return; }
 
-    let previous_slot = equipped_magic.selected_slot - 1;
-    let last_slot = equipped_magic.entries.iter()
-        .filter(|e| e.param_id > 1)
-        .count() - 1;
-
-    if previous_slot < 0 {
-        equipped_magic.selected_slot = last_slot as i32;
-        return;
+        let current = *(equip_magic_data.add(0x80) as *const i32);
+        let previous = if current <= 0 { 0 } else { current - 1 };
+        *(equip_magic_data.add(0x80) as *mut i32) = previous;
     }
-
-    equipped_magic.selected_slot = previous_slot;
 }
 
 fn cartesian_product(keycodes: Vec<HashSet<Keycode>>) -> Vec<HashSet<Keycode>> {
@@ -269,29 +477,40 @@ pub unsafe extern "C" fn DllMain(_hmodule: u64, reason: u32) -> bool {
     std::thread::spawn(|| {
         wait_for_system_init(&Program::current(), Duration::MAX)
             .expect("Timeout waiting for system init");
-
+        
         let device_state = DeviceState::new();
         let config = read_config();
+        let autocast = read_autocast();
+        let second_catalyst = read_second_catalyst();
+        let second_catalyst_slots = read_second_catalyst_slots();
+        let autouse_vk = read_autouse();
 
-        let mut last_cycle_back_run = Instant::now();
-        let cycle_back_rebound = Duration::from_millis(50);
+        let mut cycle_back_held = false;
+        let mut cast_held = false;
+        let mut cast_charging = false;
+        let mut held_cast: Option<CastInput> = None;
+        let mut quick_held = false;
 
         let mut last_hud_update_run = Instant::now();
         let hud_update_rebound = Duration::from_secs(3);
         let mut player_hud_type = None;
         let mut is_hud_restored = true;
 
+        
         let cs_task = unsafe { CSTaskImp::instance().unwrap() };
+
+
 
         cs_task.run_recurring(
             move |_: &FD4TaskData| {
                 let Some(main_player) = unsafe { WorldChrMan::instance() }
                     .ok()
-                    .and_then(|wcm| wcm.main_player.as_mut())
+                    .and_then(|wcm| wcm.main_player.as_ref())
                 else {
                     return
                 };
-                if main_player.chr_ins.module_container.data.hp <= 0 {
+
+                if main_player.chr_ins.modules.data.hp <= 0 {
                     return;
                 }
 
@@ -320,28 +539,90 @@ pub unsafe extern "C" fn DllMain(_hmodule: u64, reason: u32) -> bool {
 
                 let pressed_keys = device_state.get_keys();
 
+                let cycle_back_down = keybindings.iter().any(|(keys, action)| {
+                    matches!(action, Action::CycleBack)
+                        && is_all_keybinding_keys_pressed(keys, &pressed_keys)
+                });
+                if !cycle_back_down {
+                    cycle_back_held = false;
+                }
+
+                let cast_down = keybindings.iter().any(|(keys, action)| {
+                    matches!(action, Action::SetMemorySlot(_))
+                        && is_all_keybinding_keys_pressed(keys, &pressed_keys)
+                });
+                if !cast_down {
+                    if cast_charging {
+                        if let Some(input) = held_cast {
+                            hold_cast(input, false);
+                        }
+                        held_cast = None;
+                        cast_charging = false;
+                    }
+                    cast_held = false;
+                }
+
+                let quick_down = keybindings.iter().any(|(keys, action)| {
+                    matches!(action, Action::SetQuickSlot(_))
+                        && is_all_keybinding_keys_pressed(keys, &pressed_keys)
+                });
+                if !quick_down {
+                    quick_held = false;
+                }
+
                 for (keybinds, action) in keybindings {
                     if !is_all_keybinding_keys_pressed(&keybinds, &pressed_keys) {
                         continue;
                     }
                     match action {
                         Action::SetMemorySlot(slot) => {
+                            if cast_held {
+                                break;
+                            }
+                            cast_held = true;
+
                             get_game_data_man().game_settings.hud_type = HudType::On;
                             last_hud_update_run = Instant::now();
                             is_hud_restored = false;
 
                             set_memory_slot(get_game_data_man(), slot - 1);
+                            let input = if second_catalyst.is_some() && second_catalyst_slots.contains(slot) {
+                                second_catalyst
+                            } else {
+                                autocast
+                            };
+                            if let Some(input) = input {
+                                hold_cast(input, true);
+                                held_cast = Some(input);
+                                cast_charging = true;
+                            }
+                        }
+                        Action::SetQuickSlot(slot) => {
+                            if quick_held {
+                                break;
+                            }
+                            quick_held = true;
+
+                            get_game_data_man().game_settings.hud_type = HudType::On;
+                            last_hud_update_run = Instant::now();
+                            is_hud_restored = false;
+
+                            set_quick_slot(get_game_data_man(), slot - 1);
+                            if let Some(vk) = autouse_vk {
+                                press_use_item(vk);
+                            }
                         }
                         Action::CycleBack => {
-                            if last_cycle_back_run.elapsed() < cycle_back_rebound {
-                                return;
+                            if cycle_back_held {
+                                break;
                             }
+                            cycle_back_held = true;
+
                             get_game_data_man().game_settings.hud_type = HudType::On;
                             last_hud_update_run = Instant::now();
                             is_hud_restored = false;
 
                             back_cycle_memory_slot(get_game_data_man());
-                            last_cycle_back_run = Instant::now();
                         }
                         Action::NoOp => {}
                     }
